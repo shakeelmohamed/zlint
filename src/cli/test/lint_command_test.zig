@@ -12,8 +12,9 @@
 const std = @import("std");
 const Fixture = @import("Fixture.zig");
 const walk = @import("../../io/Walker.zig");
+const FileFilter = @import("../lint/visitor.zig").FileFilter;
 const lint_command = @import("../lint_command.zig");
-const lint_config = @import("../lint_config.zig");
+const gitignore = @import("../lint/gitignore.zig");
 const Config = @import("zlint").lint.Config;
 
 const t = std.testing;
@@ -54,10 +55,10 @@ fn expectLints(project: Project, expected: []const []const u8) !void {
     // would silently inherit zlint's.
     var ignore = project.ignore;
     if (hasGitignore(project.files)) {
-        var config = Config.DEFAULT.intoManaged(&arena, null);
-        config.config.ignore = project.ignore;
-        try lint_config.readGitignore(&config, t.io, fixture.root(), .nearest_from_root);
-        ignore = config.config.ignore;
+        var config = Config.default.intoManaged(&arena, null);
+        config.config.ignore = .new(project.ignore);
+        try gitignore.readGitignore(&config, t.io, fixture.root(), .nearest_from_root);
+        ignore = config.config.ignore.patterns;
     }
 
     const found = try collectLintTargets(
@@ -90,20 +91,22 @@ const ListSink = struct {
     }
 };
 
-/// Every file `lint` would send to the linter if it were run from `root`, in
-/// visit order. Paths are relative to `root`; the slice and its contents are
-/// owned by `alloc`.
+/// Every file `lint` would send to the linter if it were run from `root` with
+/// `targets` on the command line, in visit order. Paths are relative to `root`;
+/// the slice and its contents are owned by `alloc`.
 ///
-/// This is discovery without a `LintService`, stdout, or a process-wide cwd.
-/// `lint` walks with the same `FileFilter`, so the two cannot disagree.
+/// This is discovery without a `LintService`, stdout, or a process-wide cwd. It
+/// mirrors `lintTargets` in `lint_command.zig`: a `.zig` target is linted as
+/// named, anything else is opened as a directory and walked with the same
+/// `FileFilter`.
 fn collectLintTargets(
     alloc: Allocator,
     io: std.Io,
     root: std.Io.Dir,
-    include: []const []const u8,
+    targets: []const []const u8,
     exclude: []const []const u8,
 ) ![][]u8 {
-    const Filter = lint_command.FileFilter(ListSink);
+    const Filter = FileFilter(ListSink);
 
     var sink = ListSink{ .allocator = alloc };
     errdefer {
@@ -114,12 +117,33 @@ fn collectLintTargets(
     var visitor: Filter = .{
         .sink = &sink,
         .allocator = alloc,
-        .include = include,
-        .exclude = exclude,
+        .exclude = .new(exclude),
     };
-    var walker = try walk.Walker(Filter).init(alloc, io, root, &visitor);
+
+    if (targets.len == 0 or (targets.len == 1 and std.mem.eql(u8, targets[0], "."))) {
+        var walker = try walk.Walker(Filter).initAtDir(alloc, io, .{ .dir = root }, &visitor);
+        defer walker.deinit();
+        try walker.walk();
+        return sink.files.toOwnedSlice(alloc);
+    }
+
+    var walker = try walk.Walker(Filter).init(alloc, io, &visitor);
     defer walker.deinit();
-    try walker.walk();
+    for (targets) |target| {
+        if (target.len == 0) continue;
+
+        const prefix = lint_command.normalizeTarget(target);
+
+        if (std.mem.endsWith(u8, prefix, ".zig")) {
+            sink.accept(try alloc.dupe(u8, prefix));
+            continue;
+        }
+
+        var dir = root.openDir(io, target, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        try walker.reset(.{ .dir = dir, .prefix = prefix });
+        try walker.walk();
+    }
 
     return sink.files.toOwnedSlice(alloc);
 }
@@ -210,7 +234,7 @@ test "never lints a vendor directory nested inside the project" {
 test "ignore skips a directory named directly" {
     try expectLints(.{
         .files = &.{ .{ .path = "src/main.zig" }, .{ .path = "examples/demo.zig" } },
-        .ignore = &.{"examples"},
+        .ignore = &.{"**/examples/**"},
     }, &.{"src/main.zig"});
 }
 
@@ -238,28 +262,21 @@ test "ignore matches a file pattern at any depth" {
 }
 
 test "ignore matches a directory at any depth" {
-    try todo(
-        "`**/generated` matches nothing: directories are pruned with startsWith, " ++
-            "which a glob never matches, and the file pattern stops at the directory name",
-        expectLints(.{
-            .files = &.{
-                .{ .path = "src/main.zig" },
-                .{ .path = "src/generated/proto.zig" },
-                .{ .path = "lib/generated/other.zig" },
-            },
-            .ignore = &.{"**/generated"},
-        }, &.{"src/main.zig"}),
-    );
+    try expectLints(.{
+        .files = &.{
+            .{ .path = "src/main.zig" },
+            .{ .path = "src/generated/proto.zig" },
+            .{ .path = "lib/generated/other.zig" },
+        },
+        .ignore = &.{"**/generated/**"},
+    }, &.{"src/main.zig"});
 }
 
 test "ignore does not skip sibling directories that share a prefix" {
-    try todo(
-        "directories are pruned with startsWith, so `src` also prunes `srcgen`",
-        expectLints(.{
-            .files = &.{ .{ .path = "src/main.zig" }, .{ .path = "srcgen/tool.zig" } },
-            .ignore = &.{"src"},
-        }, &.{"srcgen/tool.zig"}),
-    );
+    try expectLints(.{
+        .files = &.{ .{ .path = "src/main.zig" }, .{ .path = "srcgen/tool.zig" } },
+        .ignore = &.{"src/**"},
+    }, &.{"srcgen/tool.zig"});
 }
 
 // =============================================================================
@@ -287,58 +304,64 @@ test "ignores comments and blank lines in gitignore" {
 }
 
 test "respects gitignore directory entries written with a trailing slash" {
-    try todo(
-        "`build/` matches neither the directory prune (startsWith) nor the file " ++
-            "glob, so a trailing slash silently disables the entry",
-        expectLints(.{ .files = &.{
-            .{ .path = ".gitignore", .contents = "build/\n" },
-            .{ .path = "src/main.zig" },
-            .{ .path = "build/gen.zig" },
-        } }, &.{"src/main.zig"}),
-    );
+    try expectLints(.{ .files = &.{
+        .{ .path = ".gitignore", .contents = "build/\n" },
+        .{ .path = "src/main.zig" },
+        .{ .path = "build/gen.zig" },
+    } }, &.{"src/main.zig"});
 }
 
 test "respects gitignore patterns at any depth" {
-    try todo(
-        "git matches a slash-free pattern at any depth, but `*` in a zlint glob " ++
-            "does not cross path separators",
-        expectLints(.{ .files = &.{
-            .{ .path = ".gitignore", .contents = "*.gen.zig\n" },
-            .{ .path = "src/main.zig" },
-            .{ .path = "root.gen.zig" },
-            .{ .path = "src/deep/proto.gen.zig" },
-        } }, &.{"src/main.zig"}),
-    );
+    try expectLints(.{ .files = &.{
+        .{ .path = ".gitignore", .contents = "*.gen.zig\n" },
+        .{ .path = "src/main.zig" },
+        .{ .path = "root.gen.zig" },
+        .{ .path = "src/deep/proto.gen.zig" },
+    } }, &.{"src/main.zig"});
 }
 
 test "respects gitignore entries for a directory nested in the project" {
-    try todo(
-        "git ignores `node_modules` at any depth; startsWith only prunes it at " ++
-            "the project root",
-        expectLints(.{ .files = &.{
-            .{ .path = ".gitignore", .contents = "node_modules\n" },
-            .{ .path = "src/main.zig" },
-            .{ .path = "node_modules/a.zig" },
-            .{ .path = "tools/node_modules/b.zig" },
-        } }, &.{"src/main.zig"}),
-    );
+    try expectLints(.{ .files = &.{
+        .{ .path = ".gitignore", .contents = "node_modules\n" },
+        .{ .path = "src/main.zig" },
+        .{ .path = "node_modules/a.zig" },
+        .{ .path = "tools/node_modules/b.zig" },
+    } }, &.{"src/main.zig"});
+}
+
+test "a negated entry does not resurrect an ignored directory" {
+    try expectLints(.{ .files = &.{
+        .{ .path = ".gitignore", .contents = "build\n!src/keep.zig\n" },
+        .{ .path = "src/main.zig" },
+        .{ .path = "src/keep.zig" },
+        .{ .path = "build/gen.zig" },
+    } }, &.{ "src/keep.zig", "src/main.zig" });
+}
+
+// git re-includes nothing under an excluded folder; zlint honors the negation.
+test "a negation reaching into an ignored directory re-includes only what it names" {
+    try expectLints(.{ .files = &.{
+        .{ .path = ".gitignore", .contents = "build\n!gen.zig\n" },
+        .{ .path = "src/main.zig" },
+        .{ .path = "build/gen.zig" },
+        .{ .path = "build/other.zig" },
+    } }, &.{ "build/gen.zig", "src/main.zig" });
 }
 
 test "respects root-anchored gitignore entries" {
-    try todo(
-        "a leading `/` anchors a gitignore pattern to the project root; zlint " ++
-            "matches it literally, so it never matches anything",
-        expectLints(.{ .files = &.{
-            .{ .path = ".gitignore", .contents = "/dist\n" },
-            .{ .path = "src/main.zig" },
-            .{ .path = "dist/out.zig" },
-            .{ .path = "src/dist/keep.zig" },
-        } }, &.{ "src/dist/keep.zig", "src/main.zig" }),
-    );
+    try expectLints(.{ .files = &.{
+        .{ .path = ".gitignore", .contents = "/dist\n" },
+        .{ .path = "src/main.zig" },
+        .{ .path = "dist/out.zig" },
+        .{ .path = "src/dist/keep.zig" },
+    } }, &.{ "src/dist/keep.zig", "src/main.zig" });
 }
 
 // =============================================================================
 // Paths passed on the command line
+//
+// Named paths are files or directories, not globs. A `.zig` path is linted as
+// named; anything else is walked as a directory.
 // =============================================================================
 
 test "lints only the file named on the command line" {
@@ -348,39 +371,131 @@ test "lints only the file named on the command line" {
     }, &.{"src/main.zig"});
 }
 
+test "lints every file named on the command line" {
+    try expectLints(.{
+        .files = &.{
+            .{ .path = "src/main.zig" },
+            .{ .path = "src/other.zig" },
+            .{ .path = "src/third.zig" },
+        },
+        .args = &.{ "src/main.zig", "src/third.zig" },
+    }, &.{ "src/main.zig", "src/third.zig" });
+}
+
 test "lints a directory named on the command line" {
-    try todo(
-        "`zlint src` matches nothing: command-line paths are matched as globs, " ++
-            "and `src` does not match `src/main.zig`",
-        expectLints(.{
-            .files = &.{
-                .{ .path = "src/main.zig" },
-                .{ .path = "src/deep/other.zig" },
-                .{ .path = "test/helper.zig" },
-            },
-            .args = &.{"src"},
-        }, &.{ "src/deep/other.zig", "src/main.zig" }),
-    );
+    try expectLints(.{
+        .files = &.{
+            .{ .path = "src/main.zig" },
+            .{ .path = "src/deep/other.zig" },
+            .{ .path = "test/helper.zig" },
+        },
+        .args = &.{"src"},
+    }, &.{ "src/deep/other.zig", "src/main.zig" });
+}
+
+test "lints a directory named with a trailing slash" {
+    try expectLints(.{
+        .files = &.{ .{ .path = "src/main.zig" }, .{ .path = "test/helper.zig" } },
+        .args = &.{"src/"},
+    }, &.{"src/main.zig"});
+}
+
+test "mixes files and directories named on the command line" {
+    try expectLints(.{
+        .files = &.{
+            .{ .path = "build.zig" },
+            .{ .path = "src/main.zig" },
+            .{ .path = "test/helper.zig" },
+        },
+        .args = &.{ "build.zig", "test" },
+    }, &.{ "build.zig", "test/helper.zig" });
+}
+
+test "lints nothing when a named directory does not exist" {
+    try expectLints(.{
+        .files = &.{.{ .path = "src/main.zig" }},
+        .args = &.{"nope"},
+    }, &.{});
+}
+
+// `.` is the whole project, same as passing nothing at all.
+test "lints the whole project when the only path named is dot" {
+    try expectLints(.{
+        .files = &.{ .{ .path = "build.zig" }, .{ .path = "src/main.zig" } },
+        .args = &.{"."},
+    }, &.{ "build.zig", "src/main.zig" });
 }
 
 test "lints a file named with a leading ./" {
-    try todo(
-        "walk paths carry no `./` prefix, so `./src/main.zig` never matches",
-        expectLints(.{
-            .files = &.{ .{ .path = "src/main.zig" }, .{ .path = "src/other.zig" } },
-            .args = &.{"./src/main.zig"},
-        }, &.{"src/main.zig"}),
-    );
+    try expectLints(.{
+        .files = &.{ .{ .path = "src/main.zig" }, .{ .path = "src/other.zig" } },
+        .args = &.{"./src/main.zig"},
+    }, &.{"src/main.zig"});
+}
+
+test "ignore applies to a directory named with a leading ./" {
+    try expectLints(.{
+        .files = &.{
+            .{ .path = "src/main.zig" },
+            .{ .path = "src/generated/proto.zig" },
+        },
+        .ignore = &.{"src/generated/**"},
+        .args = &.{"./src"},
+    }, &.{"src/main.zig"});
+}
+
+test "ignore applies when the whole project is named as ./" {
+    try expectLints(.{
+        .files = &.{
+            .{ .path = "build.zig" },
+            .{ .path = "src/generated/proto.zig" },
+        },
+        .ignore = &.{"src/generated/**"},
+        .args = &.{"./"},
+    }, &.{"build.zig"});
+}
+
+test "ignore applies to a directory named with a trailing slash" {
+    try expectLints(.{
+        .files = &.{
+            .{ .path = "src/main.zig" },
+            .{ .path = "src/generated/proto.zig" },
+        },
+        .ignore = &.{"src/generated/**"},
+        .args = &.{"src/"},
+    }, &.{"src/main.zig"});
+}
+
+test "collapses repeated ./ segments at the front of a target" {
+    try expectLints(.{
+        .files = &.{ .{ .path = "src/main.zig" }, .{ .path = "test/helper.zig" } },
+        .args = &.{".//./src"},
+    }, &.{"src/main.zig"});
 }
 
 test "lints a file named on the command line even when it is ignored" {
-    try todo(
-        "naming a file explicitly should override `ignore` (or report that it " ++
-            "was skipped); today it is dropped silently and zlint exits 0",
-        expectLints(.{
-            .files = &.{ .{ .path = "src/main.zig" }, .{ .path = "generated/proto.zig" } },
-            .ignore = &.{"generated"},
-            .args = &.{"generated/proto.zig"},
-        }, &.{"generated/proto.zig"}),
-    );
+    try expectLints(.{
+        .files = &.{ .{ .path = "src/main.zig" }, .{ .path = "generated/proto.zig" } },
+        .ignore = &.{"generated/**"},
+        .args = &.{"generated/proto.zig"},
+    }, &.{"generated/proto.zig"});
+}
+
+// Naming the directory is not naming its files, so `ignore` still applies.
+test "ignore still applies inside a directory named on the command line" {
+    try expectLints(.{
+        .files = &.{
+            .{ .path = "src/main.zig" },
+            .{ .path = "src/generated/proto.zig" },
+        },
+        .ignore = &.{"**/generated/**"},
+        .args = &.{"src"},
+    }, &.{"src/main.zig"});
+}
+
+test "a directory named on the command line does not resurrect vendor" {
+    try expectLints(.{
+        .files = &.{ .{ .path = "src/main.zig" }, .{ .path = "src/vendor/dep.zig" } },
+        .args = &.{"src"},
+    }, &.{"src/main.zig"});
 }

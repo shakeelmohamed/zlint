@@ -1,4 +1,5 @@
 {
+  "ignore": ["foo/**", "bar/*.zig"],
   "rules": {
     "unsafe-undefined": "warn"
   }
